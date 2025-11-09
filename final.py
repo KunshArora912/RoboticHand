@@ -6,25 +6,30 @@ import serial
 import cv2
 import mediapipe as mp
 
-# ==== USER SETTINGS ====
-COM_PORT = "COM5"      # <-- change to your Arduino port
+# ==== USER SETTINGS (replace your existing block with this) ====
+COM_PORT = "COM5"
 BAUD     = 115200
 SEND_HZ  = 30
 MIRROR   = True
 
-# Finger servo limits (min=open, max=closed)
-SERVO_OPEN   = 20
-SERVO_CLOSED = 160
+# Per-finger angle limits (thumb, index, middle, ring, pinky)
+# Set OPEN < CLOSED. If a finger moves backwards, either swap these two values
+# for that finger OR set INVERT_FINGER[i] = True below (software invert).
+SERVO_OPEN  = [20, 20, 20, 20, 20]    # open angles per finger
+SERVO_CLOSE = [160,160,160,160,160]   # closed angles per finger
 
-# Wrist servo limits
-WRIST_MIN_DEG = 30     # wrist fully left
-WRIST_MAX_DEG = 150    # wrist fully right
-WRIST_RANGE_DEG = 80   # how much real rotation to map (~±40° about reference)
+# Software invert per finger (thumb..pinky). True means flip 0↔1 for that finger.
+INVERT_FINGER = [True, True, True, True, True]   # <- try True for all to start
 
-# Smoothing
+# Wrist limits
+WRIST_MIN_DEG = 30
+WRIST_MAX_DEG = 150
+WRIST_RANGE_DEG = 80
+
 SMOOTH_ALPHA = 0.35
 smoothed = [90, 90, 90, 90, 90, 90]
-# =======================
+# ===============================================================
+
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
@@ -36,32 +41,63 @@ hands = mp_hands.Hands(
 )
 drawer = mp.solutions.drawing_utils
 
-def clamp(v, lo, hi):
+def clamp(v, lo, hi): 
     return lo if v < lo else hi if v > hi else v
 
-def openness_to_angle(x):
-    return int(round(SERVO_OPEN + x * (SERVO_CLOSED - SERVO_OPEN)))
+def openness_to_angle(x, i):
+    # x in [0..1] (0=open, 1=closed for logic)
+    # flip if requested
+    if INVERT_FINGER[i]:
+        x = 1.0 - x
+    lo, hi = SERVO_OPEN[i], SERVO_CLOSE[i]
+    return int(round(lo + x * (hi - lo)))
+
 
 def hand_to_openness(lm):
-    # lm: 21 landmarks, normalized coordinates (x right, y down)
-    def finger_metric(tip, pip):  # negative when extended (tip above PIP)
-        return lm[tip].y - lm[pip].y
+    """
+    Returns 5 openness values in [0..1] for (thumb, index, middle, ring, pinky),
+    where 0=open, 1=closed (logical).
+    """
 
-    def lin01(val, v_open=-0.18, v_closed=0.05):
-        t = (val - v_open) / (v_closed - v_open)
+    def unit(vx, vy):
+        n = (vx*vx + vy*vy) ** 0.5
+        return (0.0, 0.0) if n == 0 else (vx/n, vy/n)
+
+    def angle_cos(ax, ay, bx, by):
+        ux, uy = unit(ax, ay)
+        vx, vy = unit(bx, by)
+        return clamp(ux*vx + uy*vy, -1.0, 1.0)  # cos(theta)
+
+    # Generic finger curl using two segments: (MCP->PIP) and (PIP->TIP).
+    # cos=1 → straight (open), cos=-1 → fully folded (closed).
+    def finger_curl(mcp_idx, pip_idx, tip_idx):
+        ax = lm[pip_idx].x - lm[mcp_idx].x
+        ay = lm[pip_idx].y - lm[mcp_idx].y
+        bx = lm[tip_idx].x - lm[pip_idx].x
+        by = lm[tip_idx].y - lm[pip_idx].y
+        c = angle_cos(ax, ay, bx, by)  # -1..1
+        # Map cos to curl in [0..1]: open(=straight) -> 0, folded -> 1
+        # Tunable thresholds for your framing
+        c_open, c_closed = 0.85, -0.2
+        t = (c_open - c) / (c_open - c_closed)
         return clamp(t, 0.0, 1.0)
 
-    # Thumb: use horizontal spread between tip (4) and MCP (2)
+    # Thumb: use spread plus a small curl component
+    # You can tune these if your thumb behaves oddly.
     thumb_spread = abs(lm[4].x - lm[2].x)
     thumb_closed, thumb_open = 0.02, 0.10
-    thumb_open01 = 1.0 - clamp((thumb_spread - thumb_closed) / (thumb_open - thumb_closed), 0.0, 1.0)
+    thumb_spread_open = 1.0 - clamp((thumb_spread - thumb_closed) / (thumb_open - thumb_closed), 0.0, 1.0)
+    # Add thumb curl (using CMC approx 2->3 and 3->4)
+    thumb_curl = finger_curl(2, 3, 4)
+    thumb = clamp(0.6*thumb_spread_open + 0.4*thumb_curl, 0.0, 1.0)
 
-    idx_open01 = lin01(finger_metric(8, 6))
-    mid_open01 = lin01(finger_metric(12, 10))
-    rng_open01 = lin01(finger_metric(16, 14))
-    pky_open01 = lin01(finger_metric(20, 18))
+    index  = finger_curl(5, 6, 8)
+    middle = finger_curl(9,10,12)
+    ring   = finger_curl(13,14,16)
+    pinky  = finger_curl(17,18,20)
 
-    return [thumb_open01, idx_open01, mid_open01, rng_open01, pky_open01]
+    return [thumb, index, middle, ring, pinky]
+
 
 # --- Wrist rotation estimator ---
 # We use the vector across knuckles: index MCP (5) -> pinky MCP (17).
@@ -124,9 +160,9 @@ try:
             hand = res.multi_hand_landmarks[0]
             lm = hand.landmark
 
-            # 5 fingers
-            open01 = hand_to_openness(lm)
-            raw_fingers = [openness_to_angle(v) for v in open01]
+            open01 = hand_to_openness(lm)              # list of 5 floats 0..1
+            raw_fingers = [openness_to_angle(open01[i], i) for i in range(5)]
+
 
             # wrist
             raw_wrist = wrist_angle_deg(lm)
